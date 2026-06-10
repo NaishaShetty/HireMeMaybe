@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -10,12 +11,20 @@ from dotenv import load_dotenv
 # Load .env before any module that reads env vars
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+# Structured logging + Sentry — must be set up before any logger.getLogger() calls
+from app.logging_config import setup_logging
+setup_logging()
+
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from app.ats.ats_scorer import calculate_ats_score
+from app.cover_letter.cover_letter_engine import CoverLetterEngine
 from app.data.rewrite_dataset import append_rewrite_example
 from app.intelligence.company_engine import CompanyIntelEngine
 from app.interview.interview_engine import InterviewEngine
@@ -24,18 +33,27 @@ from app.parsers.contact_parser import extract_email, extract_phone
 from app.parsers.resume_text_extractor import extract_pdf_text
 from app.parsers.section_parser import extract_sections
 from app.parsers.skill_parser import extract_skills
+import time as _time
+from app.utils.text_utils import sanitize_for_prompt
+from app.database import init_db, log_request
 from app.rewrite.diff_analyzer import DiffAnalyzer
+from app.rewrite.hallucination_guard import HallucinationGuard
 from app.rewrite.optimization_loop import OptimizationLoop
 from app.rewrite.recommendation_engine import RecommendationEngine
-from app.rewrite.resume_formatter import export_resume
+from app.rewrite.resume_formatter import export_resume, export_cover_letter_pdf
 from app.rewrite.rewrite_analyzer import RewriteAnalyzer
 from app.rewrite.rewrite_engine import RewriteEngine
 from app.rewrite.rewrite_evaluator import RewriteEvaluator
+from app.parsers.jd_image_parser import JDImageParserError, extract_jd_from_image
+from app.parsers.jd_url_parser import JDURLParserError, extract_jd_from_url
 from app.services.jd_builder import build_jd_json
 from app.services.resume_builder import build_resume_json
 from app.similarity.similarity_engine import calculate_similarity
 
+limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="HireMeMaybe API", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,25 +64,70 @@ app.add_middleware(
 )
 
 logger = logging.getLogger(__name__)
-if not logging.getLogger().handlers:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-    )
 
 REWRITE_ENGINE = RewriteEngine()
 INTERVIEW_ENGINE = InterviewEngine()
 COMPANY_INTEL_ENGINE = CompanyIntelEngine()
 REWRITE_EVALUATOR = RewriteEvaluator()
+COVER_LETTER_ENGINE = CoverLetterEngine()
 
 UPLOAD_DIR = Path(__file__).resolve().parent.parent / "uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+
+@app.on_event("startup")
+async def startup() -> None:
+    init_db()
+    logger.info("HireMeMaybe API started")
+
+
+@app.middleware("http")
+async def audit_middleware(request: Request, call_next):
+    start = _time.monotonic()
+    response = None
+    error_detail = None
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as exc:
+        error_detail = str(exc)
+        raise
+    finally:
+        latency_ms = round((_time.monotonic() - start) * 1000, 2)
+        status_code = response.status_code if response else 500
+        client_ip = request.client.host if request.client else None
+
+        log_request(
+            endpoint=request.url.path,
+            method=request.method,
+            client_ip=client_ip,
+            status_code=status_code,
+            latency_ms=latency_ms,
+            error=error_detail,
+        )
+
+        log_fn = logger.error if status_code >= 500 else logger.warning if status_code >= 400 else logger.info
+        log_fn(
+            "http_request",
+            extra={
+                "method": request.method,
+                "path": request.url.path,
+                "status_code": status_code,
+                "latency_ms": latency_ms,
+                "client_ip": client_ip,
+                "error": error_detail,
+            },
+        )
 
 _ALLOWED_EXTENSIONS = {".pdf"}
 
 
 class JDRequest(BaseModel):
     text: str
+
+
+class JDURLRequest(BaseModel):
+    url: str = Field(..., description="Public URL of a job posting")
 
 
 class MatchRequest(BaseModel):
@@ -117,6 +180,18 @@ class InterviewPrepRequest(BaseModel):
 class CompanyIntelRequest(BaseModel):
     company: str
     role: str = Field(default="Software Engineer")
+
+
+class CoverLetterRequest(BaseModel):
+    resume_text: str
+    jd_text: str
+    role: str = Field(default="the role")
+    company: str = Field(default="your company")
+
+
+class ExportCoverLetterRequest(BaseModel):
+    cover_letter: str
+    company: str = Field(default="")
 
 
 def _build_analysis(*, ats_score, semantic_score, missing_skills, matched_skills, skill_match_score):
@@ -201,7 +276,8 @@ def health():
 
 
 @app.post("/parse-resume")
-async def parse_resume(file: UploadFile = File(...)):
+@limiter.limit("30/minute")
+async def parse_resume(request: Request, file: UploadFile = File(...)):
     safe_name = Path(file.filename or "upload").name
     if Path(safe_name).suffix.lower() not in _ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -215,24 +291,97 @@ async def parse_resume(file: UploadFile = File(...)):
         text = extract_pdf_text(str(file_path))
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"Could not read PDF: {exc}") from exc
-    email = extract_email(text)
-    phone = extract_phone(text)
-    skills = extract_skills(text)
-    sections = extract_sections(text)
-    return {**build_resume_json(email=email, phone=phone, skills=skills, sections=sections), "resume_text": text}
+    finally:
+        # Always delete the uploaded file — resumes contain PII.
+        try:
+            file_path.unlink(missing_ok=True)
+        except Exception as del_exc:
+            logger.warning("Failed to delete uploaded file %s: %s", file_path, del_exc)
+    safe_text = sanitize_for_prompt(text)
+    email = extract_email(safe_text)
+    phone = extract_phone(safe_text)
+    skills = extract_skills(safe_text)
+    sections = extract_sections(safe_text)
+    return {**build_resume_json(email=email, phone=phone, skills=skills, sections=sections), "resume_text": safe_text}
 
 
 @app.post("/parse-jd")
-async def parse_jd(jd: JDRequest):
+@limiter.limit("30/minute")
+async def parse_jd(request: Request, jd: JDRequest):
     if not jd.text.strip():
         raise HTTPException(status_code=400, detail="Job description text cannot be empty.")
-    return build_jd_json(jd.text)
+    safe_text = sanitize_for_prompt(jd.text)
+    return build_jd_json(safe_text)
+
+
+@app.post("/parse-jd-from-url")
+@limiter.limit("20/minute")
+async def parse_jd_from_url(request: Request, body: JDURLRequest):
+    """Extract and parse a job description from a public URL.
+
+    Tries direct HTTP scraping first; falls back to Jina AI Reader for
+    JavaScript-rendered pages (LinkedIn, Workday, etc.).
+    """
+    url = body.url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="URL cannot be empty.")
+    try:
+        raw_text = extract_jd_from_url(url)
+    except JDURLParserError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"URL fetch failed: {exc}") from exc
+    safe_text = sanitize_for_prompt(raw_text)
+    if not safe_text.strip():
+        raise HTTPException(status_code=422, detail="Could not extract any text from the provided URL.")
+    return {**build_jd_json(safe_text), "raw_text": safe_text}
+
+
+_ALLOWED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_EXTENSION_TO_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+}
+
+
+@app.post("/parse-jd-from-image")
+@limiter.limit("10/minute")
+async def parse_jd_from_image(request: Request, file: UploadFile = File(...)):
+    """Extract and parse a job description from a screenshot of a job posting.
+
+    Accepts PNG, JPG, WEBP, or GIF. Uses vision LLM (OpenAI / Gemini / Anthropic)
+    to OCR the image and extract structured JD data.
+    """
+    ext = Path(file.filename or "upload").suffix.lower()
+    if ext not in _ALLOWED_IMAGE_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'. Upload a PNG, JPG, WEBP, or GIF screenshot.",
+        )
+    mime_type = _EXTENSION_TO_MIME[ext]
+    image_bytes = await file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+    try:
+        raw_text = extract_jd_from_image(image_bytes, mime_type=mime_type)
+    except JDImageParserError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Image OCR failed: {exc}") from exc
+    safe_text = sanitize_for_prompt(raw_text)
+    if not safe_text.strip():
+        raise HTTPException(status_code=422, detail="Could not extract any text from the image.")
+    return {**build_jd_json(safe_text), "raw_text": safe_text}
 
 
 @app.post("/match-resume-jd")
-async def match_resume_jd(request: MatchRequest):
-    match_result = match_resume_to_jd(request.resume, request.jd)
-    ats_score = calculate_ats_score(request.resume, request.jd, match_result)
+@limiter.limit("30/minute")
+async def match_resume_jd(request: Request, body: MatchRequest):
+    match_result = match_resume_to_jd(body.resume, body.jd)
+    ats_score = calculate_ats_score(body.resume, body.jd, match_result)
     return {
         "ats_score": ats_score,
         "skill_match_score": match_result["skill_match_score"],
@@ -242,16 +391,21 @@ async def match_resume_jd(request: MatchRequest):
 
 
 @app.post("/semantic-match")
-async def semantic_match(request: SimilarityRequest):
-    similarity = calculate_similarity(request.resume_text, request.jd_text)
+@limiter.limit("30/minute")
+async def semantic_match(request: Request, body: SimilarityRequest):
+    similarity = calculate_similarity(
+        sanitize_for_prompt(body.resume_text),
+        sanitize_for_prompt(body.jd_text),
+    )
     return {"semantic_similarity": similarity}
 
 
 @app.post("/interview-score")
-async def interview_score(request: InterviewScoreRequest):
-    match_result = match_resume_to_jd(request.resume, request.jd)
-    ats_score = calculate_ats_score(request.resume, request.jd, match_result)
-    semantic_score = calculate_similarity(request.resume_text, request.jd_text)
+@limiter.limit("20/minute")
+async def interview_score(request: Request, body: InterviewScoreRequest):
+    match_result = match_resume_to_jd(body.resume, body.jd)
+    ats_score = calculate_ats_score(body.resume, body.jd, match_result)
+    semantic_score = calculate_similarity(body.resume_text, body.jd_text)
     skill_match_score = match_result["skill_match_score"]
     matched_skills = match_result["matched_skills"]
     missing_skills = match_result["missing_skills"]
@@ -274,10 +428,13 @@ async def interview_score(request: InterviewScoreRequest):
 
 
 @app.post("/rewrite-resume")
-async def rewrite_resume(request: RewriteResumeRequest):
-    match_result = match_resume_to_jd(request.resume, request.jd)
-    before_score = calculate_ats_score(request.resume, request.jd, match_result)
-    semantic_score = calculate_similarity(request.resume_text, request.jd_text)
+@limiter.limit("10/minute")
+async def rewrite_resume(request: Request, body: RewriteResumeRequest):
+    safe_resume_text = sanitize_for_prompt(body.resume_text)
+    safe_jd_text = sanitize_for_prompt(body.jd_text)
+    match_result = match_resume_to_jd(body.resume, body.jd)
+    before_score = calculate_ats_score(body.resume, body.jd, match_result)
+    semantic_score = calculate_similarity(safe_resume_text, safe_jd_text)
     analysis = _build_analysis(
         ats_score=before_score, semantic_score=semantic_score,
         missing_skills=match_result["missing_skills"],
@@ -286,24 +443,27 @@ async def rewrite_resume(request: RewriteResumeRequest):
     )
     recommendations = RecommendationEngine.generate(analysis)
     optimizer = OptimizationLoop(
-        max_passes=request.max_passes,
-        num_candidates=request.num_candidates,
+        max_passes=body.max_passes,
+        num_candidates=body.num_candidates,
         rewrite_engine=REWRITE_ENGINE,
     )
     optimization = optimizer.optimize(
-        resume=request.resume, jd=request.jd,
-        resume_text=request.resume_text, jd_text=request.jd_text,
+        resume=body.resume, jd=body.jd,
+        resume_text=safe_resume_text, jd_text=safe_jd_text,
         recommendations=recommendations["recommendations"],
     )
     changes = DiffAnalyzer.analyze(
-        before=request.resume_text, after=optimization["optimized_resume"],
+        before=safe_resume_text, after=optimization["optimized_resume"],
     )["changes"]
+    hallucination_report = HallucinationGuard().verify(
+        safe_resume_text, optimization["optimized_resume"], jd_text=safe_jd_text,
+    ).to_dict()
     if optimization["accepted"]:
         try:
             append_rewrite_example(
-                resume_before=request.resume_text,
+                resume_before=body.resume_text,
                 resume_after=optimization["optimized_resume"],
-                jd=request.jd_text,
+                jd=body.jd_text,
                 ats_before=optimization["before_score"],
                 ats_after=optimization["after_score"],
                 improvement=optimization["improvement"],
@@ -322,73 +482,65 @@ async def rewrite_resume(request: RewriteResumeRequest):
         "changes": changes,
         "optimized_resume": optimization["optimized_resume"],
         "evaluation": optimization.get("evaluation", {}),
+        "hallucination_report": hallucination_report,
     }
 
 
-@app.post("/evaluate-rewrite")
-async def evaluate_rewrite(request: EvaluateRewriteRequest):
-    """Stage 7: Multi-metric rewrite evaluation returning composite rewrite_quality score."""
-    jd_keywords: list[str] = []
-    for fname in ("required_skills", "preferred_skills", "technologies", "keywords"):
-        val = request.jd.get(fname, [])
-        if isinstance(val, list):
-            jd_keywords.extend(str(v) for v in val if v)
-
-    semantic_similarity = calculate_similarity(request.rewritten_text, request.jd_text)
-    match_result = match_resume_to_jd(request.rewritten_resume, request.jd)
-    ats_score = calculate_ats_score(request.rewritten_resume, request.jd, match_result)
-
-    eval_result = REWRITE_EVALUATOR.evaluate(
-        original_text=request.original_text,
-        rewritten_text=request.rewritten_text,
-        rewritten_resume=request.rewritten_resume,
-        ats_score=ats_score,
-        semantic_similarity=float(semantic_similarity),
-        jd_keywords=jd_keywords,
-    )
-    return eval_result.to_dict()
-
 
 @app.post("/interview-prep")
-async def interview_prep(request: InterviewPrepRequest):
-    """Stage 9: Generate interview questions and STAR answers from resume + JD."""
+@limiter.limit("10/minute")
+async def interview_prep(request: Request, body: InterviewPrepRequest):
+    """Generate interview questions, weakness probes, and STAR answer drafts."""
     result = INTERVIEW_ENGINE.generate(
-        resume_text=request.resume_text,
-        jd_text=request.jd_text,
-        matched_skills=request.matched_skills,
-        missing_skills=request.missing_skills,
+        resume_text=sanitize_for_prompt(body.resume_text),
+        jd_text=sanitize_for_prompt(body.jd_text),
+        matched_skills=body.matched_skills,
+        missing_skills=body.missing_skills,
     )
     return result.to_dict()
 
 
 @app.post("/company-intel")
-async def company_intel(request: CompanyIntelRequest):
-    """Stage 10: Generate Company Intelligence Report (tech stack, interview process, salary, etc.)."""
-    if not request.company.strip():
+@limiter.limit("10/minute")
+async def company_intel(request: Request, body: CompanyIntelRequest):
+    """Generate a company intelligence report for interview preparation."""
+    if not body.company.strip():
         raise HTTPException(status_code=400, detail="Company name cannot be empty.")
-    report = COMPANY_INTEL_ENGINE.generate(
-        company=request.company.strip(),
-        role=request.role.strip() or "Software Engineer",
+    result = COMPANY_INTEL_ENGINE.generate(
+        company=sanitize_for_prompt(body.company),
+        role=sanitize_for_prompt(body.role),
     )
-    return report.to_dict()
+    return result.to_dict()
+
+
+@app.post("/generate-cover-letter")
+@limiter.limit("10/minute")
+async def generate_cover_letter(request: Request, body: CoverLetterRequest):
+    """Generate a tailored cover letter from a resume and job description."""
+    if not body.resume_text.strip():
+        raise HTTPException(status_code=400, detail="Resume text cannot be empty.")
+    if not body.jd_text.strip():
+        raise HTTPException(status_code=400, detail="Job description text cannot be empty.")
+    result = COVER_LETTER_ENGINE.generate(
+        resume_text=sanitize_for_prompt(body.resume_text),
+        jd_text=sanitize_for_prompt(body.jd_text),
+        role=body.role,
+        company=body.company,
+    )
+    return result.to_dict()
 
 
 @app.post("/export-resume")
-async def export_resume_endpoint(request: ExportResumeRequest):
-    """Convert optimized resume plain text into a formatted PDF or DOCX file."""
-    if not request.resume_text.strip():
-        raise HTTPException(status_code=400, detail="resume_text cannot be empty.")
-    pkg = "python-docx" if request.format == "docx" else "reportlab"
+@limiter.limit("20/minute")
+async def export_resume_endpoint(request: Request, body: ExportResumeRequest):
+    """Export a plain-text resume as PDF or DOCX."""
+    if not body.resume_text.strip():
+        raise HTTPException(status_code=400, detail="Resume text cannot be empty.")
     try:
-        file_bytes, media_type, filename = export_resume(request.resume_text, request.format)
-    except ImportError as exc:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Missing dependency for {request.format.upper()} export: {exc}. Run: pip install {pkg}",
-        ) from exc
+        file_bytes, media_type, filename = export_resume(body.resume_text, body.format)
     except Exception as exc:
+        logger.error("export_resume failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Export failed: {exc}") from exc
-
     return Response(
         content=file_bytes,
         media_type=media_type,
@@ -396,41 +548,21 @@ async def export_resume_endpoint(request: ExportResumeRequest):
     )
 
 
-@app.post("/debug-rewrite")
-async def debug_rewrite(request: RewriteResumeRequest):
-    """Development endpoint: full optimisation trace."""
-    match_result = match_resume_to_jd(request.resume, request.jd)
-    original_ats_score = calculate_ats_score(request.resume, request.jd, match_result)
-    semantic_score = calculate_similarity(request.resume_text, request.jd_text)
-    analysis = _build_analysis(
-        ats_score=original_ats_score, semantic_score=semantic_score,
-        missing_skills=match_result["missing_skills"],
-        matched_skills=match_result["matched_skills"],
-        skill_match_score=match_result["skill_match_score"],
+@app.post("/export-cover-letter-pdf")
+@limiter.limit("20/minute")
+async def export_cover_letter_pdf_endpoint(request: Request, body: ExportCoverLetterRequest):
+    """Render a plain-text cover letter as a PDF."""
+    if not body.cover_letter.strip():
+        raise HTTPException(status_code=400, detail="Cover letter text cannot be empty.")
+    try:
+        file_bytes = export_cover_letter_pdf(body.cover_letter, company=body.company)
+    except Exception as exc:
+        logger.error("export_cover_letter_pdf failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Export failed: {exc}") from exc
+    safe_company = re.sub(r"[^a-zA-Z0-9_\- ]", "", body.company).strip().replace(" ", "_")
+    filename = f"Cover_Letter_{safe_company}.pdf" if safe_company else "Cover_Letter.pdf"
+    return Response(
+        content=file_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
-    recommendations = RecommendationEngine.generate(analysis)
-    optimizer = OptimizationLoop(
-        max_passes=request.max_passes,
-        num_candidates=request.num_candidates,
-        rewrite_engine=REWRITE_ENGINE,
-    )
-    trace = optimizer.optimize_with_debug(
-        resume=request.resume, jd=request.jd,
-        resume_text=request.resume_text, jd_text=request.jd_text,
-        recommendations=recommendations["recommendations"],
-    )
-    result = trace["result"]
-    debug = trace["debug"]
-    return {
-        "original_resume": debug["original_resume"],
-        "candidate_resume": debug["candidate_resume"],
-        "parsed_original_resume": debug["parsed_original_resume"],
-        "parsed_candidate_resume": debug["parsed_candidate_resume"],
-        "original_ats_score": debug["original_ats_score"],
-        "candidate_ats_score": debug["candidate_ats_score"],
-        "accepted": debug["accepted"],
-        "reason": debug["reason"],
-        "result": result,
-        "analysis": analysis,
-        "recommendations": recommendations,
-    }

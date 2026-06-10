@@ -365,6 +365,84 @@ def format_pdf(resume_data: dict[str, Any]) -> bytes:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def export_cover_letter_pdf(cover_letter_text: str, company: str = "") -> bytes:
+    """Render a plain-text cover letter as a clean PDF and return raw bytes."""
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.colors import HexColor
+    from reportlab.lib.units import inch
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+    from reportlab.lib.enums import TA_LEFT, TA_CENTER
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=letter,
+        rightMargin=1.0 * inch,
+        leftMargin=1.0 * inch,
+        topMargin=1.0 * inch,
+        bottomMargin=1.0 * inch,
+    )
+
+    purple = HexColor("#5B21B6")
+    dark   = HexColor("#1A1A2E")
+    grey   = HexColor("#444444")
+
+    header_style = ParagraphStyle(
+        "CLHeader",
+        fontName="Helvetica-Bold",
+        fontSize=11,
+        leading=15,
+        textColor=HexColor("#888888"),
+        alignment=TA_CENTER,
+        spaceAfter=2,
+    )
+    body_style = ParagraphStyle(
+        "CLBody",
+        fontName="Helvetica",
+        fontSize=11,
+        leading=18,
+        textColor=grey,
+        spaceAfter=8,
+    )
+    signature_style = ParagraphStyle(
+        "CLSig",
+        fontName="Helvetica",
+        fontSize=11,
+        leading=16,
+        textColor=dark,
+        spaceAfter=4,
+    )
+
+    story = []
+
+    # Thin header bar
+    if company:
+        safe = company.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        story.append(Paragraph(f"Cover Letter — {safe}", header_style))
+    else:
+        story.append(Paragraph("Cover Letter", header_style))
+    story.append(HRFlowable(width="100%", thickness=1.5, color=purple, spaceAfter=20))
+
+    # Split into paragraphs
+    paragraphs = [p.strip() for p in cover_letter_text.split("\n\n") if p.strip()]
+    for i, para in enumerate(paragraphs):
+        lines = para.splitlines()
+        # Detect signature block (short lines at the end)
+        is_sig = i == len(paragraphs) - 1 and len(lines) <= 3
+        safe_para = "<br/>".join(
+            line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            for line in lines
+        )
+        style = signature_style if is_sig else body_style
+        story.append(Paragraph(safe_para, style))
+        if not is_sig:
+            story.append(Spacer(1, 4))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
 def export_resume(resume_text: str, fmt: str) -> tuple[bytes, str, str]:
     """Parse *resume_text* and render as *fmt* ('pdf' or 'docx').
 

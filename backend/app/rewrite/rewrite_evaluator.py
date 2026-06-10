@@ -189,26 +189,18 @@ def _section_quality_score(resume: dict[str, Any]) -> float:
 def _hallucination_risk_score(
     original_text: str,
     rewritten_text: str,
+    jd_text: str = "",
 ) -> float:
-    """Estimate hallucination risk as 0–100 (0 = high risk, 100 = clean).
+    """Compute a 0–100 trust score using the HallucinationGuard.
 
-    Extracts capitalised multi-word tokens (likely named entities: companies,
-    tools, certifications) from the rewritten resume and checks how many were
-    *not* present in the original.  A high ratio of new entities → higher risk.
+    Delegates to :mod:`app.rewrite.hallucination_guard` which performs
+    fact-level verification: skills, certifications, degrees, numeric
+    claims, and proper nouns are each checked independently.
+
+    100 = no invented facts detected; 0 = heavily hallucinated.
     """
-    def _extract_entities(text: str) -> set[str]:
-        # Capture sequences of title-case or ALL-CAPS words ≥ 2 chars
-        tokens = re.findall(r"\b[A-Z][a-zA-Z0-9+#.]*(?:\s+[A-Z][a-zA-Z0-9+#.]*)*\b", text)
-        return {t.lower() for t in tokens if len(t) > 2}
-
-    original_entities = _extract_entities(original_text)
-    rewritten_entities = _extract_entities(rewritten_text)
-    if not rewritten_entities:
-        return 100.0
-    new_entities = rewritten_entities - original_entities
-    risk_ratio = len(new_entities) / len(rewritten_entities)
-    # risk_ratio 0 → score 100; risk_ratio 1 → score 0
-    return round(max(0.0, 100.0 - risk_ratio * 100.0), 2)
+    from app.rewrite.hallucination_guard import compute_hallucination_trust_score
+    return compute_hallucination_trust_score(original_text, rewritten_text, jd_text)
 
 
 # ---------------------------------------------------------------------------
@@ -228,6 +220,7 @@ class RewriteEvaluator:
         ats_score: float,
         semantic_similarity: float,
         jd_keywords: list[str] | None = None,
+        jd_text: str = "",
     ) -> EvaluationResult:
         """Return a fully-populated :class:`EvaluationResult`.
 
@@ -246,13 +239,16 @@ class RewriteEvaluator:
             internally to put it on the same scale as the other metrics.
         jd_keywords:
             Optional list of keywords extracted from the job description.
+        jd_text:
+            Raw job description text used by the hallucination guard to allow
+            JD-mirrored language without penalising it.
         """
         sem_pct = float(semantic_similarity) * 100.0
 
         readability = _readability_score(rewritten_text)
         kw_density = _keyword_density_score(rewritten_text, jd_keywords or [])
         section_quality = _section_quality_score(rewritten_resume)
-        hallucination_risk = _hallucination_risk_score(original_text, rewritten_text)
+        hallucination_risk = _hallucination_risk_score(original_text, rewritten_text, jd_text)
 
         return EvaluationResult(
             ats_score=float(ats_score),

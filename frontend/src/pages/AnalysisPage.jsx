@@ -107,7 +107,7 @@ function ScoreMeter({ label, score, color }) {
   );
 }
 
-export default function AnalysisPage({ data, resumeData, jdData, resumeText, jdText, onRewrite, onInterviewPrep, onCompanyIntel, onBack }) {
+export default function AnalysisPage({ data, resumeData, jdData, resumeText, jdText, onRewrite, onInterviewPrep, onCoverLetter, onCompanyIntel, onBack }) {
   const {
     interview_probability_score = 0,
     ats_score = 0,
@@ -276,14 +276,14 @@ export default function AnalysisPage({ data, resumeData, jdData, resumeText, jdT
           </div>
 
           {/* Secondary CTAs */}
-          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:16 }}>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:16 }}>
             <button
               onClick={onInterviewPrep}
               style={{
                 display:'flex', alignItems:'center', justifyContent:'center', gap:10,
                 padding:'18px 24px', borderRadius:16, border:'1px solid rgba(16,185,129,0.3)',
                 background:'rgba(16,185,129,0.07)', cursor:'pointer',
-                fontWeight:700, fontSize:15, color:'var(--green)',
+                fontWeight:700, fontSize:14, color:'var(--green)',
                 transition:'all 0.2s',
               }}
               onMouseEnter={e => { e.currentTarget.style.background='rgba(16,185,129,0.13)'; e.currentTarget.style.borderColor='rgba(16,185,129,0.5)'; }}
@@ -295,12 +295,33 @@ export default function AnalysisPage({ data, resumeData, jdData, resumeText, jdT
             </button>
 
             <button
+              onClick={onCoverLetter}
+              style={{
+                display:'flex', alignItems:'center', justifyContent:'center', gap:10,
+                padding:'18px 24px', borderRadius:16, border:'1px solid rgba(245,158,11,0.3)',
+                background:'rgba(245,158,11,0.07)', cursor:'pointer',
+                fontWeight:700, fontSize:14, color:'var(--amber)',
+                transition:'all 0.2s',
+              }}
+              onMouseEnter={e => { e.currentTarget.style.background='rgba(245,158,11,0.13)'; e.currentTarget.style.borderColor='rgba(245,158,11,0.5)'; }}
+              onMouseLeave={e => { e.currentTarget.style.background='rgba(245,158,11,0.07)'; e.currentTarget.style.borderColor='rgba(245,158,11,0.3)'; }}
+            >
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>
+              </svg>
+              Cover Letter
+              <ArrowRight />
+            </button>
+
+            <button
               onClick={onCompanyIntel}
               style={{
                 display:'flex', alignItems:'center', justifyContent:'center', gap:10,
                 padding:'18px 24px', borderRadius:16, border:'1px solid rgba(59,130,246,0.3)',
                 background:'rgba(59,130,246,0.07)', cursor:'pointer',
-                fontWeight:700, fontSize:15, color:'#3b82f6',
+                fontWeight:700, fontSize:14, color:'#3b82f6',
                 transition:'all 0.2s',
               }}
               onMouseEnter={e => { e.currentTarget.style.background='rgba(59,130,246,0.13)'; e.currentTarget.style.borderColor='rgba(59,130,246,0.5)'; }}

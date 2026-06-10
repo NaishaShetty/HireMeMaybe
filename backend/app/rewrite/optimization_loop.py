@@ -85,6 +85,9 @@ class OptimizationDebugResult:
         }
 
 
+_HALLUCINATION_RISK_FLOOR = 40.0  # Below this score the rewrite is rejected (too many new entities)
+
+
 class OptimizationLoop:
     """Rewrite a resume N times, evaluate each with multi-metric scoring, keep the best."""
 
@@ -148,7 +151,16 @@ class OptimizationLoop:
             eval_result = self._evaluator.evaluate(
                 original_text=resume_text, rewritten_text=rewritten_text, rewritten_resume=rewritten_resume,
                 ats_score=rewritten_ats, semantic_similarity=rewritten_semantic, jd_keywords=jd_keywords,
+                jd_text=jd_text,
             )
+
+            # Reject rewrites with unacceptably high hallucination risk
+            if eval_result.hallucination_risk < _HALLUCINATION_RISK_FLOOR:
+                logger.warning(
+                    "Candidate %d rejected — hallucination_risk %.1f < %.1f threshold",
+                    attempt_index + 1, eval_result.hallucination_risk, _HALLUCINATION_RISK_FLOOR,
+                )
+                continue
 
             candidate = CandidateResult(
                 attempt=attempt_index + 1,

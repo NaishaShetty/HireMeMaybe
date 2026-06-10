@@ -58,6 +58,29 @@ export async function getCompanyIntel({ company, role = 'Software Engineer' }) {
   return res.json();
 }
 
+export async function generateCoverLetter({ resume_text, jd_text, role, company }) {
+  const res = await fetch(`${BASE}/generate-cover-letter`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ resume_text, jd_text, role, company }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function exportCoverLetterPdf({ cover_letter, company = '' }) {
+  const res = await fetch(`${BASE}/export-cover-letter-pdf`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ cover_letter, company }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const blob = await res.blob();
+  const safe = company.replace(/[^a-zA-Z0-9 _-]/g, '').trim().replace(/\s+/g, '_');
+  const filename = safe ? `Cover_Letter_${safe}.pdf` : 'Cover_Letter.pdf';
+  return { blob, filename };
+}
+
 export async function exportResume({ resume_text, format }) {
   const res = await fetch(`${BASE}/export-resume`, {
     method: 'POST',

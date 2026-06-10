@@ -2,6 +2,13 @@ fastapi
 uvicorn[standard]
 python-multipart
 python-dotenv
+slowapi
+httpx
+beautifulsoup4
+
+# Structured logging + error tracking
+python-json-logger
+sentry-sdk[fastapi]
 
 openai
 google-genai
@@ -14,6 +21,7 @@ pandas
 numpy
 
 sentence-transformers
+redis
 torch
 scikit-learn
 transformers
